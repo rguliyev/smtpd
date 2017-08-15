@@ -5,14 +5,15 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
-	"expvar"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/sirupsen/logrus"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 var (
@@ -21,8 +22,23 @@ var (
 	mailFromRE = regexp.MustCompile(`[Ff][Rr][Oo][Mm]:<(.*)>`) // Delivery Status Notifications are sent with "MAIL FROM:<>"
 
 	// Commands allowed when TLS is required but not in use as per RFC 3207. Any other command gets a 530 response.
-	allowedCmds  = map[string]bool{"NOOP": true, "EHLO": true, "STARTTLS": true, "QUIT": true}
-	SMTPDMetrics = expvar.NewMap("smtpd")
+	allowedCmds = map[string]bool{"NOOP": true, "EHLO": true, "STARTTLS": true, "QUIT": true}
+
+	// prometheus metrics
+	statusTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "smtpd_status_total",
+			Help: "How many SMTP requests processed, partitioned by status code",
+		},
+		[]string{"code", "extended"},
+	)
+	resolvedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "smtpd_resolved_total",
+			Help: "Resolved hostnames",
+		},
+		[]string{"status"},
+	)
 )
 
 // Handler function called upon successful receipt of an email.
@@ -32,6 +48,20 @@ type Handler func(remoteAddr net.Addr, from string, to []string, data []byte)
 // and then calls Serve with handler to handle requests
 // on incoming connections.
 func ListenAndServe(addr string, handler Handler, appname string, hostname string) error {
+
+	// Register prometheus metrics
+	if err := prometheus.Register(statusTotal); err != nil {
+	    logrus.Fatal("statusTotal not registered:", err)
+		return err
+	} else {
+	    logrus.Debug("statusTotal registered.")
+	}
+	if err := prometheus.Register(resolvedTotal); err != nil {
+	    logrus.Fatal("resolvedTotal not registered:", err)
+		return err
+	} else {
+	    logrus.Debug("resolvedTotal registered.")
+	}
 	srv := &Server{Addr: addr, Handler: handler, Appname: appname, Hostname: hostname}
 	return srv.ListenAndServe()
 }
@@ -142,10 +172,10 @@ func (srv *Server) newSession(conn net.Conn) (s *session) {
 	s.remoteIP, _, _ = net.SplitHostPort(s.conn.RemoteAddr().String())
 	names, err := net.LookupAddr(s.remoteIP)
 	if err == nil && len(names) > 0 {
-		SMTPDMetrics.Add("remote_resolved", 1)
+		resolvedTotal.WithLabelValues("success").Inc()
 		s.remoteHost = names[0]
 	} else {
-		SMTPDMetrics.Add("remote_unknown", 1)
+		resolvedTotal.WithLabelValues("failure").Inc()
 		s.remoteHost = "unknown"
 	}
 
@@ -173,7 +203,7 @@ loop:
 		line, err := s.readLine()
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				SMTPDMetrics.Add("status_421", 1)
+				statusTotal.WithLabelValues("421", "4.4.2").Inc()
 				s.writef("421 4.4.2 %s %s ESMTP Service closing transmission channel after timeout exceeded", s.srv.Hostname, s.srv.Appname)
 			}
 			break
@@ -183,7 +213,7 @@ loop:
 		// If TLS is configured and required, but not already in use, reject every command except NOOP, EHLO, STARTTLS, or QUIT as per RFC 3207.
 		if s.srv.TLSConfig != nil && s.srv.TLSRequired == true && s.tls == false {
 			if _, ok := allowedCmds[verb]; !ok {
-				SMTPDMetrics.Add("status_530", 1)
+				statusTotal.WithLabelValues("530", "5.7.0").Inc()
 				s.writef("530 5.7.0 Must issue a STARTTLS command first")
 				continue
 			}
@@ -209,7 +239,7 @@ loop:
 		case "MAIL":
 			match := mailFromRE.FindStringSubmatch(args)
 			if match == nil {
-				SMTPDMetrics.Add("status_501", 1)
+				statusTotal.WithLabelValues("501", "5.5.4").Inc()
 				s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid FROM parameter)")
 			} else {
 				from = match[1]
@@ -219,19 +249,19 @@ loop:
 			buffer.Reset()
 		case "RCPT":
 			if from == "" {
-				SMTPDMetrics.Add("status_503", 1)
+				statusTotal.WithLabelValues("503", "5.5.1").Inc()
 				s.writef("503 5.5.1 Bad sequence of commands (MAIL required before RCPT)")
 				break
 			}
 
 			match := rcptToRE.FindStringSubmatch(args)
 			if match == nil {
-				SMTPDMetrics.Add("status_501", 1)
+				statusTotal.WithLabelValues("501", "5.5.4").Inc()
 				s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid TO parameter)")
 			} else {
 				// RFC 5321 specifies 100 minimum recipients
 				if len(to) == 100 {
-					SMTPDMetrics.Add("status_452", 1)
+					statusTotal.WithLabelValues("452", "4.5.3").Inc()
 					s.writef("452 4.5.3 Too many recipients")
 				} else {
 					to = append(to, match[1])
@@ -240,7 +270,7 @@ loop:
 			}
 		case "DATA":
 			if from == "" || to == nil {
-				SMTPDMetrics.Add("status_503", 1)
+				statusTotal.WithLabelValues("503", "5.5.1").Inc()
 				s.writef("503 5.5.1 Bad sequence of commands (MAIL & RCPT required before DATA)")
 				break
 			}
@@ -253,7 +283,7 @@ loop:
 			data, err := s.readData()
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					SMTPDMetrics.Add("status_421", 1)
+					statusTotal.WithLabelValues("421", "4.4.2").Inc()
 					s.writef("421 4.4.2 %s %s ESMTP Service closing transmission channel after timeout exceeded", s.srv.Hostname, s.srv.Appname)
 				}
 				break loop
@@ -263,7 +293,7 @@ loop:
 			buffer.Reset()
 			buffer.Write(s.makeHeaders(to))
 			buffer.Write(data)
-			SMTPDMetrics.Add("success", 1)
+			statusTotal.WithLabelValues("250", "2.0.0").Inc()
 			s.writef("250 2.0.0 Ok: queued")
 
 			// Pass mail on to handler.
@@ -287,19 +317,19 @@ loop:
 			s.writef("250 2.0.0 Ok")
 		case "HELP", "VRFY", "EXPN":
 			// See RFC 5321 section 4.2.4 for usage of 500 & 502 reply codes
-			SMTPDMetrics.Add("status_502", 1)
+			statusTotal.WithLabelValues("502", "5.5.1").Inc()
 			s.writef("502 5.5.1 Command not implemented")
 		case "STARTTLS":
 			// Handle case where TLS is requested but not configured (and therefore not listed as a service extension).
 			if s.srv.TLSConfig == nil {
-				SMTPDMetrics.Add("status_502", 1)
+				statusTotal.WithLabelValues("502", "5.5.1").Inc()
 				s.writef("502 5.5.1 Command not implemented")
 				break
 			}
 
 			// Handle case where STARTTLS is called more than once (in violation of RFC 3207).
 			if s.tls == true {
-				SMTPDMetrics.Add("status_503", 1)
+				statusTotal.WithLabelValues("503", "5.5.1").Inc()
 				s.writef("503 5.5.1 Bad sequence of commands (TLS already in use)")
 				break
 			}
@@ -310,7 +340,7 @@ loop:
 			tlsConn := tls.Server(s.conn, s.srv.TLSConfig)
 			err := tlsConn.Handshake()
 			if err != nil {
-				SMTPDMetrics.Add("status_403", 1)
+				statusTotal.WithLabelValues("403", "4.7.0").Inc()
 				s.writef("403 4.7.0 TLS handshake failed")
 				break
 			}
@@ -327,7 +357,7 @@ loop:
 			to = nil
 			buffer.Reset()
 		default:
-			SMTPDMetrics.Add("status_500", 1)
+			statusTotal.WithLabelValues("500", "5.5.2").Inc()
 			// See RFC 5321 section 4.2.4 for usage of 500 & 502 reply codes
 			s.writef("500 5.5.2 Syntax error, command unrecognized")
 		}
@@ -342,11 +372,7 @@ func (s *session) writef(format string, args ...interface{}) error {
 
 	fmt.Fprintf(s.bw, format+"\r\n", args...)
 	err := s.bw.Flush()
-
-	if Debug {
-		log.Println(s.remoteIP, "WROTE", fmt.Sprintf(format, args...))
-	}
-
+	logrus.Debug("smtpd: ", s.remoteIP, " WROTE ", fmt.Sprintf(format, args...))
 	return err
 }
 
@@ -361,11 +387,7 @@ func (s *session) readLine() (string, error) {
 		return "", err
 	}
 	line = strings.TrimSpace(line) // Strip trailing \r\n
-
-	if Debug {
-		log.Println(s.remoteIP, "READ ", line)
-	}
-
+	logrus.Debug("smtpd: ", s.remoteIP, " READ  ", line)
 	return line, err
 }
 
