@@ -49,19 +49,6 @@ type Handler func(remoteAddr net.Addr, from string, to []string, data []byte)
 // on incoming connections.
 func ListenAndServe(addr string, handler Handler, appname string, hostname string) error {
 
-	// Register prometheus metrics
-	if err := prometheus.Register(statusTotal); err != nil {
-	    logrus.Fatal("statusTotal not registered:", err)
-		return err
-	} else {
-	    logrus.Debug("statusTotal registered.")
-	}
-	if err := prometheus.Register(resolvedTotal); err != nil {
-	    logrus.Fatal("resolvedTotal not registered:", err)
-		return err
-	} else {
-	    logrus.Debug("resolvedTotal registered.")
-	}
 	srv := &Server{Addr: addr, Handler: handler, Appname: appname, Hostname: hostname}
 	return srv.ListenAndServe()
 }
@@ -119,6 +106,20 @@ func (srv *Server) ListenAndServe() error {
 
 	var ln net.Listener
 	var err error
+
+	// Register prometheus metrics
+	if err := prometheus.Register(statusTotal); err != nil {
+	    logrus.Fatal("statusTotal not registered:", err)
+		return err
+	} else {
+	    logrus.Debug("statusTotal registered.")
+	}
+	if err := prometheus.Register(resolvedTotal); err != nil {
+	    logrus.Fatal("resolvedTotal not registered:", err)
+		return err
+	} else {
+	    logrus.Debug("resolvedTotal registered.")
+	}
 
 	// If TLSListener is enabled, listen for TLS connections only.
 	if srv.TLSConfig != nil && srv.TLSListener == true {
