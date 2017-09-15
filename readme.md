@@ -1,5 +1,5 @@
 # smtpd 
-
+A fork of https://github.com/mhale/smtpd with basic Prometheus metrics and `dep` support added
 An SMTP server package written in Go, in the style of the built-in HTTP server. It meets the minimum requirements specified by RFC 2821 & 5321. 
 
 It is based on [Brad Fitzpatrick's go-smtpd](https://github.com/bradfitz/go-smtpd). The differences can be summarised as:
