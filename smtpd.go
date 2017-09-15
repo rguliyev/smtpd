@@ -190,6 +190,7 @@ func (srv *Server) newSession(conn net.Conn) (s *session) {
 func (s *session) serve() {
 	defer s.conn.Close()
 	var from string
+	var gotFrom bool
 	var to []string
 	var buffer bytes.Buffer
 
@@ -227,6 +228,7 @@ loop:
 
 			// RFC 2821 section 4.1.4 specifies that EHLO has the same effect as RSET, so reset for HELO too.
 			from = ""
+			gotFrom = false
 			to = nil
 			buffer.Reset()
 		case "EHLO":
@@ -235,6 +237,7 @@ loop:
 
 			// RFC 2821 section 4.1.4 specifies that EHLO has the same effect as RSET.
 			from = ""
+			gotFrom = false
 			to = nil
 			buffer.Reset()
 		case "MAIL":
@@ -244,12 +247,13 @@ loop:
 				s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid FROM parameter)")
 			} else {
 				from = match[1]
+				gotFrom = true
 				s.writef("250 2.1.0 Ok")
 			}
 			to = nil
 			buffer.Reset()
 		case "RCPT":
-			if from == "" {
+			if !gotFrom {
 				statusTotal.WithLabelValues("503", "5.5.1").Inc()
 				s.writef("503 5.5.1 Bad sequence of commands (MAIL required before RCPT)")
 				break
@@ -270,7 +274,7 @@ loop:
 				}
 			}
 		case "DATA":
-			if from == "" || to == nil {
+			if !gotFrom || to == nil {
 				statusTotal.WithLabelValues("503", "5.5.1").Inc()
 				s.writef("503 5.5.1 Bad sequence of commands (MAIL & RCPT required before DATA)")
 				break
@@ -304,6 +308,7 @@ loop:
 
 			// Reset for next mail.
 			from = ""
+			gotFrom = false
 			to = nil
 			buffer.Reset()
 		case "QUIT":
@@ -312,6 +317,7 @@ loop:
 		case "RSET":
 			s.writef("250 2.0.0 Ok")
 			from = ""
+			gotFrom = false
 			to = nil
 			buffer.Reset()
 		case "NOOP":
@@ -355,6 +361,7 @@ loop:
 			// RFC 3207 states the server must discard any prior knowledge obtained from the client.
 			s.remoteName = ""
 			from = ""
+			gotFrom = false
 			to = nil
 			buffer.Reset()
 		default:
